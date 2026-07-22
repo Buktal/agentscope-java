@@ -319,6 +319,11 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         this.hookDispatcher = new LegacyHookDispatcher(this);
 
         if (this.stateStore != null) {
+            // Capture the store in a final local so the saver lambda does not capture the
+            // enclosing `this`. Together with unbindStateSaver() in close(), this keeps each
+            // stateSavers entry from pinning the entire agent object graph (model/HttpClient,
+            // toolkit, stateCache) even if an entry is somehow left behind.
+            final AgentStateStore stateSaverStore = this.stateStore;
             shutdownManager.bindStateSaver(
                     this,
                     // The saver receives the precise per-(userId, sessionId) AgentState bound to
@@ -326,7 +331,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                     // interrupted request, so persist that session directly rather than the
                     // instance "last-active" CallExecution (which is wrong under concurrency).
                     agentState ->
-                            stateStore.save(
+                            stateSaverStore.save(
                                     agentState.getUserId(),
                                     agentState.getSessionId(),
                                     "agent_state",
@@ -1751,6 +1756,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
             return ToolResultBlock.builder()
                     .id(toolId)
                     .output(List.of(TextBlock.builder().text("[ERROR] " + errorMessage).build()))
+                    .state(ToolResultState.ERROR)
                     .build();
         }
 
@@ -1978,10 +1984,12 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                         new ReasoningInput(
                                                                 modelInput, tools, options));
                                 // Track any RequestStopEvent emitted by middlewares while still
-                                // exhausting the stream (publishEvent already fires on each event).
+                                // exhausting the stream. Publish at the outer reasoning boundary
+                                // so events added by onReasoning middlewares are forwarded too.
                                 AtomicReference<RequestStopEvent> stopRequested =
                                         new AtomicReference<>();
-                                return stream.doOnNext(
+                                return stream.doOnNext(this::publishEvent)
+                                        .doOnNext(
                                                 ev -> {
                                                     if (ev instanceof RequestStopEvent rs) {
                                                         stopRequested.compareAndSet(null, rs);
@@ -2118,8 +2126,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                             rc,
                             MiddlewareBase::onModelCall,
                             modelCallCore)
-                    .apply(new ModelCallInput(messages, tools, options, modelForCall()))
-                    .doOnNext(this::publishEvent);
+                    .apply(new ModelCallInput(messages, tools, options, modelForCall()));
         }
 
         private Flux<AgentEvent> modelCallStream(
@@ -3548,6 +3555,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                             AssistantMessage.builder()
                                     .name(getName())
                                     .content(TextBlock.builder().text(recoveryText).build())
+                                    .generateReason(GenerateReason.INTERRUPTED)
                                     .build();
                     scope.state.contextMutable().add(recoveryMsg);
                     return saveStateToSession(scope)
@@ -3820,8 +3828,11 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
 
     @Override
     public void close() {
-        // No-op for the core ReActAgent. Subclasses / wrappers (HarnessAgent) may release
-        // additional resources here.
+        // Release the shutdown state-saver registered in the constructor so short-lived agent
+        // instances can be garbage-collected rather than pinned by GracefulShutdownManager's
+        // process-wide singleton map. HarnessAgent.close() delegates here via delegate.close(),
+        // so this covers wrapped agents as well.
+        shutdownManager.unbindStateSaver(this);
     }
 
     // ==================== Builder ====================
