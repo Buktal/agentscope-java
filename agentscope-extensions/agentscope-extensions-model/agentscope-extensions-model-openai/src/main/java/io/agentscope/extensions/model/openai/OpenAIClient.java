@@ -24,6 +24,7 @@ import io.agentscope.core.model.transport.HttpTransportException;
 import io.agentscope.core.model.transport.HttpTransportFactory;
 import io.agentscope.core.util.JsonException;
 import io.agentscope.core.util.JsonUtils;
+import io.agentscope.extensions.model.openai.dto.OpenAIChoice;
 import io.agentscope.extensions.model.openai.dto.OpenAIRequest;
 import io.agentscope.extensions.model.openai.dto.OpenAIResponse;
 import io.agentscope.extensions.model.openai.exception.OpenAIException;
@@ -423,6 +424,19 @@ public class OpenAIClient {
                                                         errorCode,
                                                         data));
                                         return;
+                                    }
+                                    // 兼容 MiniMax 等 OpenAI 兼容服务：流式末尾会多发一个非 chunk 的
+                                    // chat.completion 汇总事件，其 message 把整条消息完整重述一遍。
+                                    // 增量 deltas 已累积出完整内容，若再累积该汇总的 message 会重复
+                                    // 累积，导致 reasoning_content / tool_call arguments 翻倍（arguments
+                                    // 变成 {...}{...} 非法 JSON），下一轮回传被模型拒答、Agent 中断。
+                                    // 这里丢弃汇总事件的 message 内容，保留 choice 的 finish_reason
+                                    // 与 usage（真实 token 计数仅在汇总事件里）。
+                                    if (!response.isChunk()) {
+                                        OpenAIChoice summaryChoice = response.getFirstChoice();
+                                        if (summaryChoice != null) {
+                                            summaryChoice.setMessage(null);
+                                        }
                                     }
                                     sink.next(response);
                                 }
