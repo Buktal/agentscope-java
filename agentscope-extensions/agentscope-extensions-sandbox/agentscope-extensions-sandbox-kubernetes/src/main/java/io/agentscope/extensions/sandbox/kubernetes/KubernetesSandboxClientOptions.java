@@ -54,15 +54,6 @@ public class KubernetesSandboxClientOptions extends SandboxClientOptions {
     private long perAttemptTimeoutSeconds = 60;
     private long portForwardTimeoutSeconds = 30;
 
-    /**
-     * Whether sandboxes created by this client own their {@code SandboxClaim}. {@code null}
-     * means the default ({@code true}). When {@code false}, {@code shutdown()} only closes the
-     * connection instead of terminating the claim, so the pod survives the per-call release —
-     * required when concurrent calls at the same isolation scope share one live claim, and the
-     * caller then owns claim deletion (e.g. an idle-eviction policy).
-     */
-    private Boolean claimOwned;
-
     @Override
     public String getType() {
         return "kubernetes";
@@ -199,25 +190,5 @@ public class KubernetesSandboxClientOptions extends SandboxClientOptions {
 
     public void setPortForwardTimeoutSeconds(long portForwardTimeoutSeconds) {
         this.portForwardTimeoutSeconds = portForwardTimeoutSeconds;
-    }
-
-    /**
-     * Returns whether created sandboxes own their claim; {@code null} means the default
-     * ({@code true}).
-     *
-     * @return claim ownership, or {@code null} for the default
-     */
-    public Boolean getClaimOwned() {
-        return claimOwned;
-    }
-
-    /**
-     * Sets whether created sandboxes own their {@code SandboxClaim}. When {@code false},
-     * {@code shutdown()} only closes the connection instead of terminating the claim.
-     *
-     * @param claimOwned claim ownership, or {@code null} to use the default ({@code true})
-     */
-    public void setClaimOwned(Boolean claimOwned) {
-        this.claimOwned = claimOwned;
     }
 }
