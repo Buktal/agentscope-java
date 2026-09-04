@@ -156,6 +156,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
+import reactor.util.context.Context;
 
 /**
  * ReAct (Reasoning and Acting) Agent implementation.
@@ -428,31 +429,20 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         if (stateStore == null) {
             return new VersionedState<>(fresh, AgentStateStore.UNVERSIONED);
         }
-        try {
-            VersionedState<AgentState> versioned =
-                    stateStore.getVersioned(userId, sessionId, "agent_state", AgentState.class);
-            if (versioned.isPresent()) {
-                return versioned;
-            }
-            LegacyStateLoader.LegacyLoadResult legacy =
-                    LegacyStateLoader.loadFromLegacySessionWithPresence(
-                            stateStore, userId, sessionId);
-            if (legacy.found()) {
-                // Legacy keys have no version; treat as create-if-absent baseline.
-                long version = stateStore.supportsVersioning() ? 0L : AgentStateStore.UNVERSIONED;
-                return new VersionedState<>(legacy.state(), version);
-            }
-            long version = stateStore.supportsVersioning() ? 0L : AgentStateStore.UNVERSIONED;
-            return new VersionedState<>(fresh, version);
-        } catch (Exception e) {
-            log.warn(
-                    "Failed to load AgentState for slot (userId={}, sessionId={}): {}",
-                    userId,
-                    sessionId,
-                    e.getMessage());
-            long version = stateStore.supportsVersioning() ? 0L : AgentStateStore.UNVERSIONED;
-            return new VersionedState<>(fresh, version);
+        VersionedState<AgentState> versioned =
+                stateStore.getVersioned(userId, sessionId, "agent_state", AgentState.class);
+        if (versioned.isPresent()) {
+            return versioned;
         }
+        LegacyStateLoader.LegacyLoadResult legacy =
+                LegacyStateLoader.loadFromLegacySessionWithPresence(stateStore, userId, sessionId);
+        if (legacy.found()) {
+            // Legacy keys have no version; treat as create-if-absent baseline.
+            long version = stateStore.supportsVersioning() ? 0L : AgentStateStore.UNVERSIONED;
+            return new VersionedState<>(legacy.state(), version);
+        }
+        long version = stateStore.supportsVersioning() ? 0L : AgentStateStore.UNVERSIONED;
+        return new VersionedState<>(fresh, version);
     }
 
     private static AgentState freshState(
@@ -504,6 +494,37 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                             }
                         })
                 .subscribeOn(Schedulers.boundedElastic());
+    }
+
+    /**
+     * Persist the safe conversation state accumulated before a failed call and rethrow the original
+     * failure. Incomplete model chunks are only held by the per-iteration accumulator, so they are
+     * deliberately not added to {@link AgentState} or persisted here.
+     *
+     * <p>{@link InterruptedException} is intentionally skipped: an interrupt is already handled end
+     * to end by {@link #handleInterrupt}, which first reconciles any dangling tool_use produced
+     * during reasoning (synthesizing error results for pending tool calls) and only then persists.
+     * Saving here would race ahead of that reconciliation and persist an inconsistent intermediate
+     * state (a tool_use with no matching tool result), so the interrupt is allowed to propagate
+     * untouched.
+     */
+    private <T> Mono<T> saveStateAfterCallFailure(CallExecution scope, Throwable callFailure) {
+        if (ExceptionUtils.containsInterruptedException(callFailure)) {
+            return Mono.error(callFailure);
+        }
+        return saveStateToSession(scope)
+                .onErrorResume(
+                        saveFailure -> {
+                            if (saveFailure != callFailure) {
+                                callFailure.addSuppressed(saveFailure);
+                            }
+                            log.warn(
+                                    "Failed to persist agent state after a call failure; preserving"
+                                            + " the original failure",
+                                    saveFailure);
+                            return Mono.empty();
+                        })
+                .then(Mono.error(callFailure));
     }
 
     /**
@@ -1193,6 +1214,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                 .ifPresent(ae -> scope.externalEventEmitter = ae);
                     }
                     return scope.doCallInner(msgs)
+                            .onErrorResume(error -> saveStateAfterCallFailure(scope, error))
                             .flatMap(result -> saveStateToSession(scope).thenReturn(result));
                 });
     }
@@ -1327,6 +1349,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                     scope.soTool = createStructuredOutputTool(jsonSchema);
 
                     return scope.doCallInner(msgs)
+                            .onErrorResume(error -> saveStateAfterCallFailure(scope, error))
                             .flatMap(
                                     result -> {
                                         Msg out = result;
@@ -1707,7 +1730,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
             // by shutdown, the client is likely retrying with the same user prompt that already
             // exists in memory. Discard the duplicate input so the agent resumes purely from its
             // saved memory context.
-            if (shutdownManager.checkAndClearShutdownInterrupted(ReActAgent.this)) {
+            if (shutdownManager.checkAndClearShutdownInterruptedForState(state)) {
                 log.info(
                         "Detected shutdown-interrupted session for agent {}, discarding duplicate"
                                 + " input",
@@ -2435,10 +2458,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                 // Empty final response: no tool calls and no visible content
                                 // (e.g. a reasoning model that wrote its whole answer into the
                                 // reasoning channel and left the content channel empty). Loop
-                                // back to reasoning with a synthetic reminder — mirroring the
-                                // "Tool not found" feedback given for hallucinated tool calls —
-                                // bounded by maxIters, instead of silently finishing with an
-                                // empty reply (#2750).
+                                // back to reasoning with a synthetic reminder.
                                 if (!hasToolCalls(eventMsg)) {
                                     log.warn(
                                             "Final response has no visible content (empty reply),"
@@ -3009,9 +3029,39 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                 Disposable toolCallsDisposable =
                                                         executeToolCalls(approved)
                                                                 .contextWrite(
-                                                                        ctx ->
-                                                                                ctx.putAll(
-                                                                                        parentCtx))
+                                                                        ctx -> {
+                                                                            Context merged =
+                                                                                    ctx.putAll(
+                                                                                            parentCtx);
+                                                                            if (!merged.hasKey(
+                                                                                            SubagentEventBus
+                                                                                                    .CONTEXT_KEY)
+                                                                                    && !merged
+                                                                                            .hasKey(
+                                                                                                    AgentEventEmitter
+                                                                                                            .CONTEXT_KEY)) {
+                                                                                if (eventSink
+                                                                                        != null) {
+                                                                                    merged =
+                                                                                            merged
+                                                                                                    .put(
+                                                                                                            AgentEventEmitter
+                                                                                                                    .CONTEXT_KEY,
+                                                                                                            (AgentEventEmitter)
+                                                                                                                    eventSink
+                                                                                                                            ::next);
+                                                                                } else if (externalEventEmitter
+                                                                                        != null) {
+                                                                                    merged =
+                                                                                            merged
+                                                                                                    .put(
+                                                                                                            AgentEventEmitter
+                                                                                                                    .CONTEXT_KEY,
+                                                                                                            externalEventEmitter);
+                                                                                }
+                                                                            }
+                                                                            return merged;
+                                                                        })
                                                                 .subscribe(
                                                                         results -> {
                                                                             List<
@@ -3556,7 +3606,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                             rc,
                             MiddlewareBase::onModelCall,
                             summaryModelCallCore)
-                    .apply(new ModelCallInput(messages, null, options, model))
+                    .apply(new ModelCallInput(messages, List.of(), options, model))
                     .doOnNext(this::publishEvent);
         }
 
@@ -3698,8 +3748,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         /**
          * Check if the ReAct loop should terminate.
          *
-         * <p>A response with tool calls (even non-existent ones) continues to the acting phase
-         * where ToolExecutor returns "Tool not found" for the model to see. A tool-free response
+         * <p>A response with tool calls continues to the acting phase. A tool-free response
          * finishes only when it carries visible content: empty or thinking-only responses (the
          * entire answer in the reasoning channel) loop back to reasoning, bounded by {@code
          * maxIters}, instead of silently ending the agent with an empty reply.
@@ -3716,28 +3765,14 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                 return false;
             }
 
-            return hasVisibleText(msg);
-        }
-
-        /**
-         * Check whether the given message requests tool execution. Shared by {@link #isFinished}
-         * and the empty-final-response guard so both derive "tool-free" from one place.
-         */
-        private static boolean hasToolCalls(Msg msg) {
-            return !msg.getContentBlocks(ToolUseBlock.class).isEmpty();
-        }
-
-        /**
-         * Check whether the given message carries user-visible content: a {@link TextBlock}
-         * with non-blank text. Text is the only channel consumers render as the assistant's
-         * visible reply (thinking never counts; tool calls are handled by the caller before
-         * this check; images and other data enter through tool results, not final responses).
-         */
-        private static boolean hasVisibleText(Msg msg) {
             return msg.getContentBlocks(TextBlock.class).stream()
                     .anyMatch(
                             textBlock ->
                                     textBlock.getText() != null && !textBlock.getText().isBlank());
+        }
+
+        private static boolean hasToolCalls(Msg msg) {
+            return !msg.getContentBlocks(ToolUseBlock.class).isEmpty();
         }
 
         /**
