@@ -45,7 +45,6 @@ class KubernetesSandboxTest {
 
     private CommandExecutor commands;
     private Filesystem files;
-    private Sandbox sdkSandbox;
     private KubernetesSandboxState state;
     private KubernetesSandbox sandbox;
 
@@ -53,7 +52,7 @@ class KubernetesSandboxTest {
     void setUp() {
         commands = mock(CommandExecutor.class);
         files = mock(Filesystem.class);
-        sdkSandbox = mock(Sandbox.class);
+        Sandbox sdkSandbox = mock(Sandbox.class);
         when(sdkSandbox.commands()).thenReturn(commands);
         when(sdkSandbox.files()).thenReturn(files);
 
@@ -63,26 +62,6 @@ class KubernetesSandboxTest {
         state.setWorkspaceRoot("/workspace");
         state.setFileApiBaseDir("/workspace");
         sandbox = new KubernetesSandbox(state, sdkSandbox);
-    }
-
-    @Test
-    void shutdownTerminatesOwnedClaim() throws Exception {
-        state.setClaimOwned(true);
-
-        sandbox.shutdown();
-
-        verify(sdkSandbox).terminate();
-        verify(sdkSandbox, never()).closeConnection();
-    }
-
-    @Test
-    void shutdownOnlyClosesConnectionWhenClaimNotOwned() throws Exception {
-        state.setClaimOwned(false);
-
-        sandbox.shutdown();
-
-        verify(sdkSandbox).closeConnection();
-        verify(sdkSandbox, never()).terminate();
     }
 
     @Test

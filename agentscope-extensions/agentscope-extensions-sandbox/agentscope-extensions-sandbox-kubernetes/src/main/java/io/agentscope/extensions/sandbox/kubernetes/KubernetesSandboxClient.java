@@ -85,15 +85,36 @@ public class KubernetesSandboxClient
             WorkspaceSpec workspaceSpec,
             SandboxSnapshotSpec snapshotSpec,
             KubernetesSandboxClientOptions options) {
+        String sessionId = UUID.randomUUID().toString();
         KubernetesSandboxClientOptions merged = merge(options);
-        KubernetesSandboxState state = initState(workspaceSpec, snapshotSpec, merged);
+
+        KubernetesSandboxState state = new KubernetesSandboxState();
+        state.setSessionId(sessionId);
+        state.setWorkspaceSpec(workspaceSpec);
+        state.setNamespace(merged.getNamespace());
+        state.setWorkspaceRoot(merged.getWorkspaceRoot());
+        state.setFileApiBaseDir(merged.getFileApiBaseDir());
+        state.setWarmPoolName(merged.getWarmPoolName());
+        state.setClaimOwned(true);
+        state.setWorkspaceRootReady(false);
+
+        if (snapshotSpec != null) {
+            state.setSnapshot(snapshotSpec.build(sessionId));
+        }
+
+        String claimName =
+                "as-sbx-"
+                        + sessionId
+                                .replace("-", "")
+                                .substring(0, Math.min(20, sessionId.replace("-", "").length()));
+        state.setClaimName(claimName);
 
         log.debug(
                 "[sandbox-k8s] Creating sandbox sessionId={} ns={} warmPool={} claim={}",
-                state.getSessionId(),
+                sessionId,
                 state.getNamespace(),
                 state.getWarmPoolName(),
-                state.getClaimName());
+                claimName);
 
         try {
             SandboxClient sdkClient = buildSdkClient(merged);
@@ -101,7 +122,7 @@ public class KubernetesSandboxClient
                     sdkClient.createSandbox(
                             CreateSandboxOptions.builder(merged.getWarmPoolName())
                                     .namespace(merged.getNamespace())
-                                    .claimName(state.getClaimName())
+                                    .claimName(claimName)
                                     .sandboxReadyTimeoutSeconds(
                                             merged.getSandboxReadyTimeoutSeconds())
                                     .build());
@@ -124,46 +145,6 @@ public class KubernetesSandboxClient
         }
     }
 
-    /**
-     * Builds the initial state for a freshly created sandbox, before the SDK sandbox is
-     * materialised. Claim ownership comes from the merged options: when the caller does not own
-     * the claim ({@code claimOwned=false}), {@code shutdown()} later only closes the connection
-     * and the pod survives the per-call release.
-     *
-     * @param workspaceSpec workspace mount rules
-     * @param snapshotSpec snapshot strategy, may be {@code null}
-     * @param merged merged client options
-     * @return the initial sandbox state
-     */
-    KubernetesSandboxState initState(
-            WorkspaceSpec workspaceSpec,
-            SandboxSnapshotSpec snapshotSpec,
-            KubernetesSandboxClientOptions merged) {
-        String sessionId = UUID.randomUUID().toString();
-
-        KubernetesSandboxState state = new KubernetesSandboxState();
-        state.setSessionId(sessionId);
-        state.setWorkspaceSpec(workspaceSpec);
-        state.setNamespace(merged.getNamespace());
-        state.setWorkspaceRoot(merged.getWorkspaceRoot());
-        state.setFileApiBaseDir(merged.getFileApiBaseDir());
-        state.setWarmPoolName(merged.getWarmPoolName());
-        state.setClaimOwned(!Boolean.FALSE.equals(merged.getClaimOwned()));
-        state.setWorkspaceRootReady(false);
-
-        if (snapshotSpec != null) {
-            state.setSnapshot(snapshotSpec.build(sessionId));
-        }
-
-        String claimName =
-                "as-sbx-"
-                        + sessionId
-                                .replace("-", "")
-                                .substring(0, Math.min(20, sessionId.replace("-", "").length()));
-        state.setClaimName(claimName);
-        return state;
-    }
-
     @Override
     public Sandbox resume(SandboxState state) {
         if (!(state instanceof KubernetesSandboxState k8s)) {
@@ -171,7 +152,6 @@ public class KubernetesSandboxClient
                     "Expected KubernetesSandboxState but got: " + state.getClass().getName());
         }
         KubernetesSandboxClientOptions merged = merge(null);
-        applyConfiguredClaimOwnership(k8s, merged);
         try {
             SandboxClient sdkClient = buildSdkClient(merged);
             io.agentscope.extensions.sandbox.kubernetes.client.Sandbox sdkSandbox =
@@ -182,23 +162,6 @@ public class KubernetesSandboxClient
                     SandboxErrorCode.WORKSPACE_START_ERROR,
                     "Failed to resume agent-sandbox client: " + e.getMessage(),
                     e);
-        }
-    }
-
-    /**
-     * Applies explicitly configured claim ownership to a resumed state, overriding the flag
-     * persisted at create time. This covers states persisted before ownership was configured
-     * (e.g. slots shared through a distributed state store): an operator opting out of
-     * termination gets it for existing states too. When the option is unset, the persisted
-     * flag wins.
-     *
-     * @param k8s the resumed state to adjust
-     * @param merged merged client options
-     */
-    void applyConfiguredClaimOwnership(
-            KubernetesSandboxState k8s, KubernetesSandboxClientOptions merged) {
-        if (merged.getClaimOwned() != null) {
-            k8s.setClaimOwned(merged.getClaimOwned());
         }
     }
 
@@ -281,7 +244,7 @@ public class KubernetesSandboxClient
                 opts.getNamespace() != null ? opts.getNamespace() : "default");
     }
 
-    KubernetesSandboxClientOptions merge(KubernetesSandboxClientOptions callOptions) {
+    private KubernetesSandboxClientOptions merge(KubernetesSandboxClientOptions callOptions) {
         KubernetesSandboxClientOptions base =
                 defaultOptions != null ? defaultOptions : new KubernetesSandboxClientOptions();
         if (callOptions == null) {
@@ -321,9 +284,6 @@ public class KubernetesSandboxClient
         if (callOptions.getServerPort() > 0) {
             o.setServerPort(callOptions.getServerPort());
         }
-        if (callOptions.getClaimOwned() != null) {
-            o.setClaimOwned(callOptions.getClaimOwned());
-        }
         return o;
     }
 
@@ -345,7 +305,6 @@ public class KubernetesSandboxClient
         o.setRequestTimeoutSeconds(src.getRequestTimeoutSeconds());
         o.setPerAttemptTimeoutSeconds(src.getPerAttemptTimeoutSeconds());
         o.setPortForwardTimeoutSeconds(src.getPortForwardTimeoutSeconds());
-        o.setClaimOwned(src.getClaimOwned());
         return o;
     }
 
