@@ -23,7 +23,6 @@ import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -44,20 +43,8 @@ import reactor.core.publisher.Mono;
  * Handles the WeCom callback URL handshake (GET) and inbound encrypted message delivery (POST).
  *
  * <p>Each {@link WeComChannel} registers itself with the controller at start-up; the controller
- * dispatches incoming requests by the {@code {channelId}} path segment. This avoids Spring-side
- * dynamic mapping registration and keeps wiring trivially testable.
- *
- * <p>Two wiring modes:
- *
- * <ul>
- *   <li><b>Static</b> — the default constructor. The path segment must name a channel registered
- *       in {@link WeComChannelRegistry}.
- *   <li><b>Multi-tenant</b> — {@link #WeComCallbackController(WeComTenantChannelManager)}. The
- *       path segment is a tenant key: credentials are resolved per callback, so tenants can be
- *       added, rotated and removed at runtime without registering channel instances. Expose a
- *       {@link WeComTenantChannelManager} bean and component scanning selects this constructor;
- *       without such a bean the no-argument constructor serves the static wiring.
- * </ul>
+ * dispatches incoming requests by {@code channelId} extracted from the URL path. This avoids
+ * Spring-side dynamic mapping registration and keeps wiring trivially testable.
  */
 @RestController
 @RequestMapping("/api/channels/wecom")
@@ -66,56 +53,15 @@ public class WeComCallbackController {
     private static final Logger log = LoggerFactory.getLogger(WeComCallbackController.class);
     private static final DocumentBuilderFactory DBF = newSafeDocumentBuilderFactory();
 
-    /** Resolves the channel serving a request's path segment; {@code null} when none exists. */
-    private final ChannelSource channelSource;
+    private final WeComChannelRegistry registry;
 
     public WeComCallbackController() {
-        this(WeComChannelRegistry.instance()::get);
-    }
-
-    /**
-     * Multi-tenant constructor: each callback's {@code {tenantKey}} path segment is resolved to
-     * credentials on every request, and the tenant's channel is materialized or refreshed through
-     * {@code manager} — see {@link WeComTenantChannelManager}.
-     *
-     * <p>All handlers are safe to invoke concurrently; resolution and credential refresh are
-     * serialized per tenant inside the manager, so this controller adds no shared mutable state.
-     *
-     * <p>Spring wiring: this class is a component, so the annotation makes Spring prefer this
-     * constructor whenever a {@link WeComTenantChannelManager} bean exists and fall back to the
-     * no-argument constructor when none does. A multi-tenant application therefore exposes the
-     * manager bean and nothing else; declaring a second {@link WeComCallbackController} bean would
-     * register the same request mappings twice and fail startup.
-     *
-     * @param manager the tenant channel manager, typically a singleton bean
-     */
-    @Autowired(required = false)
-    public WeComCallbackController(WeComTenantChannelManager manager) {
-        this(tenantSource(Objects.requireNonNull(manager, "manager")));
+        this(WeComChannelRegistry.instance());
     }
 
     /** Visible for tests — allows injecting a fresh registry. */
     WeComCallbackController(WeComChannelRegistry registry) {
-        this(Objects.requireNonNull(registry, "registry")::get);
-    }
-
-    private WeComCallbackController(ChannelSource channelSource) {
-        this.channelSource = Objects.requireNonNull(channelSource, "channelSource");
-    }
-
-    private static ChannelSource tenantSource(WeComTenantChannelManager manager) {
-        return key -> manager.channelFor(key).orElse(null);
-    }
-
-    /** Source of the channel serving a request; implementations return {@code null} if unknown. */
-    @FunctionalInterface
-    interface ChannelSource {
-        WeComChannel get(String id);
-    }
-
-    /** Visible for tests; the handlers reach channels through this seam as well. */
-    WeComChannel channelFor(String id) {
-        return channelSource.get(id);
+        this.registry = Objects.requireNonNull(registry, "registry");
     }
 
     /**
@@ -130,12 +76,12 @@ public class WeComCallbackController {
             @RequestParam("timestamp") String timestamp,
             @RequestParam("nonce") String nonce,
             @RequestParam("echostr") String echostr) {
-        WeComChannel channel = channelFor(channelId);
+        WeComChannel channel = registry.get(channelId);
         if (channel == null) {
             log.warn("WeCom verify: no channel registered for id='{}'", channelId);
             return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
         }
-        WeComCrypto crypto = channel.credentials().crypto();
+        WeComCrypto crypto = channel.crypto();
         if (!crypto.verifySignature(signature, timestamp, nonce, echostr)) {
             log.warn("WeCom verify: signature mismatch for channelId='{}'", channelId);
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
@@ -168,27 +114,23 @@ public class WeComCallbackController {
             @RequestParam("timestamp") String timestamp,
             @RequestParam("nonce") String nonce,
             @RequestBody String body) {
-        WeComChannel channel = channelFor(channelId);
+        WeComChannel channel = registry.get(channelId);
         if (channel == null) {
             log.warn("WeCom dispatch: no channel registered for id='{}'", channelId);
             return Mono.just(ResponseEntity.status(HttpStatus.NOT_FOUND).build());
         }
-        // One credential snapshot per request: a rotation concurrent with this request cannot mix
-        // generations between signature verification and decryption.
-        WeComChannel.Credentials credentials = channel.credentials();
-        WeComCrypto crypto = credentials.crypto();
         String encrypt = extractEncrypt(body);
         if (encrypt == null) {
             log.warn("WeCom dispatch: missing <Encrypt> in body (channelId='{}')", channelId);
             return Mono.just(ResponseEntity.badRequest().body(""));
         }
-        if (!crypto.verifySignature(signature, timestamp, nonce, encrypt)) {
+        if (!channel.crypto().verifySignature(signature, timestamp, nonce, encrypt)) {
             log.warn("WeCom dispatch: signature mismatch (channelId='{}')", channelId);
             return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED).build());
         }
         String xml;
         try {
-            xml = crypto.decrypt(encrypt);
+            xml = channel.crypto().decrypt(encrypt);
         } catch (RuntimeException e) {
             log.warn(
                     "WeCom dispatch: decrypt failed (channelId='{}'): {}",
@@ -205,7 +147,7 @@ public class WeComCallbackController {
             return Mono.just(ResponseEntity.ok(""));
         }
 
-        Optional<InboundMessage> inbound = credentials.mapper().map(xml);
+        Optional<InboundMessage> inbound = channel.mapper().map(xml);
         if (inbound.isEmpty()) {
             // Non-text payload or no content; ack so WeCom stops retrying.
             return Mono.just(ResponseEntity.ok(""));
@@ -220,9 +162,8 @@ public class WeComCallbackController {
             return Mono.just(ResponseEntity.ok(""));
         }
 
-        // Dispatch on the snapshot captured above, so the reply goes out with the same credential
-        // generation that verified and mapped this callback.
-        return channel.dispatch(in, credentials)
+        // Dispatch on the channel; the channel handles the reply outbound delivery.
+        return channel.dispatch(in)
                 .then(Mono.just(ResponseEntity.ok("")))
                 .onErrorResume(
                         err -> {

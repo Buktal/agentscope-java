@@ -23,7 +23,6 @@ import java.util.Objects;
 import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -48,18 +47,6 @@ import reactor.core.publisher.Mono;
  *   <li>Deduplicates by {@code header.event_id}
  *   <li>Applies the bot-loop guard and dispatches to the channel
  * </ol>
- *
- * <p>Two wiring modes:
- *
- * <ul>
- *   <li><b>Static</b> — the default constructor. The path segment must name a channel registered
- *       in {@link FeishuChannelRegistry}.
- *   <li><b>Multi-tenant</b> — {@link #FeishuCallbackController(FeishuTenantChannelManager)}. The
- *       path segment is a tenant key: credentials are resolved per callback, so tenants can be
- *       added, rotated and removed at runtime without registering channel instances. Expose a
- *       {@link FeishuTenantChannelManager} bean and component scanning selects this constructor;
- *       without such a bean the no-argument constructor serves the static wiring.
- * </ul>
  */
 @RestController
 @RequestMapping("/api/channels/feishu")
@@ -68,56 +55,15 @@ public class FeishuCallbackController {
     private static final Logger log = LoggerFactory.getLogger(FeishuCallbackController.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** Resolves the channel serving a request's path segment; {@code null} when none exists. */
-    private final ChannelSource channelSource;
+    private final FeishuChannelRegistry registry;
 
     public FeishuCallbackController() {
-        this(FeishuChannelRegistry.instance()::get);
-    }
-
-    /**
-     * Multi-tenant constructor: each callback's {@code {tenantKey}} path segment is resolved to
-     * credentials on every request, and the tenant's channel is materialized or refreshed through
-     * {@code manager} — see {@link FeishuTenantChannelManager}.
-     *
-     * <p>All handlers are safe to invoke concurrently; resolution and credential refresh are
-     * serialized per tenant inside the manager, so this controller adds no shared mutable state.
-     *
-     * <p>Spring wiring: this class is a component, so the annotation makes Spring prefer this
-     * constructor whenever a {@link FeishuTenantChannelManager} bean exists and fall back to the
-     * no-argument constructor when none does. A multi-tenant application therefore exposes the
-     * manager bean and nothing else; declaring a second {@link FeishuCallbackController} bean would
-     * register the same request mappings twice and fail startup.
-     *
-     * @param manager the tenant channel manager, typically a singleton bean
-     */
-    @Autowired(required = false)
-    public FeishuCallbackController(FeishuTenantChannelManager manager) {
-        this(tenantSource(Objects.requireNonNull(manager, "manager")));
+        this(FeishuChannelRegistry.instance());
     }
 
     /** Visible for tests — allows injecting a fresh registry. */
     FeishuCallbackController(FeishuChannelRegistry registry) {
-        this(Objects.requireNonNull(registry, "registry")::get);
-    }
-
-    private FeishuCallbackController(ChannelSource channelSource) {
-        this.channelSource = Objects.requireNonNull(channelSource, "channelSource");
-    }
-
-    private static ChannelSource tenantSource(FeishuTenantChannelManager manager) {
-        return key -> manager.channelFor(key).orElse(null);
-    }
-
-    /** Source of the channel serving a request; implementations return {@code null} if unknown. */
-    @FunctionalInterface
-    interface ChannelSource {
-        FeishuChannel get(String id);
-    }
-
-    /** Visible for tests; the handler reaches channels through this seam as well. */
-    FeishuChannel channelFor(String id) {
-        return channelSource.get(id);
+        this.registry = Objects.requireNonNull(registry, "registry");
     }
 
     @PostMapping(
@@ -130,20 +76,17 @@ public class FeishuCallbackController {
             @RequestHeader(value = "X-Lark-Request-Timestamp", required = false) String timestamp,
             @RequestHeader(value = "X-Lark-Request-Nonce", required = false) String nonce,
             @RequestBody String rawBody) {
-        FeishuChannel channel = channelFor(channelId);
+        FeishuChannel channel = registry.get(channelId);
         if (channel == null) {
             log.warn("Feishu callback: no channel registered for id='{}'", channelId);
             return Mono.just(ResponseEntity.status(HttpStatus.NOT_FOUND).build());
         }
-        // One credential snapshot per request: a rotation concurrent with this request cannot mix
-        // generations between signature verification and decryption.
-        FeishuChannel.Credentials credentials = channel.credentials();
 
         // 1. Optional signature verification on the raw body. When the channel is encrypted and a
         //    signature is supplied, the signature header MUST match.
-        if (credentials.properties().isEncrypted()
+        if (channel.properties().isEncrypted()
                 && signature != null
-                && !credentials.crypto().verifySignature(signature, timestamp, nonce, rawBody)) {
+                && !channel.crypto().verifySignature(signature, timestamp, nonce, rawBody)) {
             log.warn("Feishu callback: signature mismatch (channelId='{}')", channelId);
             return Mono.just(ResponseEntity.status(HttpStatus.UNAUTHORIZED).build());
         }
@@ -152,8 +95,8 @@ public class FeishuCallbackController {
         JsonNode envelope;
         try {
             envelope = MAPPER.readTree(rawBody);
-            if (envelope.has("encrypt") && credentials.crypto() != null) {
-                String plaintext = credentials.crypto().decrypt(envelope.get("encrypt").asText());
+            if (envelope.has("encrypt") && channel.crypto() != null) {
+                String plaintext = channel.crypto().decrypt(envelope.get("encrypt").asText());
                 envelope = MAPPER.readTree(plaintext);
             }
         } catch (RuntimeException e) {
@@ -174,7 +117,7 @@ public class FeishuCallbackController {
         Optional<String> challenge = FeishuInboundMapper.extractUrlChallenge(envelope);
         if (challenge.isPresent()) {
             String tokenFromBody = envelope.path("token").asText(null);
-            String configured = credentials.properties().verificationToken();
+            String configured = channel.properties().verificationToken();
             if (configured != null && !configured.isBlank() && !configured.equals(tokenFromBody)) {
                 log.warn(
                         "Feishu callback: verification token mismatch (channelId='{}')", channelId);
@@ -190,7 +133,7 @@ public class FeishuCallbackController {
 
         // Event authenticity is required for identity attribution. URL verification
         // above uses the challenge token; normal events carry it in the header.
-        String configuredToken = credentials.properties().verificationToken();
+        String configuredToken = channel.properties().verificationToken();
         String eventToken = envelope.path("header").path("token").asText("");
         if (configuredToken == null
                 || configuredToken.isBlank()
@@ -218,9 +161,8 @@ public class FeishuCallbackController {
             return Mono.just(ResponseEntity.ok("{}"));
         }
 
-        // 7. Dispatch on the snapshot captured above: the reply goes out on the credential
-        //    generation that verified and mapped this callback.
-        return channel.dispatch(in, credentials)
+        // 7. Dispatch on the channel; channel handles outbound delivery.
+        return channel.dispatch(in)
                 .then(Mono.just(ResponseEntity.ok("{}")))
                 .onErrorResume(
                         err -> {
