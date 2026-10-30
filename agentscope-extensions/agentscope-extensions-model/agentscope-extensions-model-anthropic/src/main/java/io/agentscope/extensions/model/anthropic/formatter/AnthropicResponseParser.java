@@ -84,13 +84,36 @@ public class AnthropicResponseParser {
                                                 .build());
                             });
 
-            // Thinking block (extended thinking)
+            // Thinking block (extended thinking). The signature authenticates the thinking
+            // block and must be preserved so it can be replayed natively on later turns.
             block.thinking()
                     .ifPresent(
-                            thinking ->
+                            thinking -> {
+                                ThinkingBlock.Builder builder =
+                                        ThinkingBlock.builder().thinking(thinking.thinking());
+                                if (thinking.signature() != null
+                                        && !thinking.signature().isEmpty()) {
+                                    builder.metadata(
+                                            Map.of(
+                                                    ThinkingBlock.METADATA_ANTHROPIC_SIGNATURE,
+                                                    thinking.signature()));
+                                }
+                                contentBlocks.add(builder.build());
+                            });
+
+            // Redacted thinking block (encrypted reasoning under enforcement policies). The
+            // payload is kept opaque so replay can restore the native block instead of
+            // silently dropping it from history.
+            block.redactedThinking()
+                    .ifPresent(
+                            redacted ->
                                     contentBlocks.add(
                                             ThinkingBlock.builder()
-                                                    .thinking(thinking.thinking())
+                                                    .metadata(
+                                                            Map.of(
+                                                                    ThinkingBlock
+                                                                            .METADATA_ANTHROPIC_REDACTED_DATA,
+                                                                    redacted.data()))
                                                     .build()));
 
             // Server tool use block (e.g. web_search executed on Anthropic's side)
@@ -132,6 +155,13 @@ public class AnthropicResponseParser {
                 .id(resolveMessageId(message))
                 .content(contentBlocks)
                 .usage(usage)
+                .finishReason(message.stopReason().map(Object::toString).orElse(null))
+                .metadata(
+                        Map.of(
+                                ChatResponse.METADATA_CONTENT_BLOCK_INDEX,
+                                0,
+                                ChatResponse.METADATA_CONTENT_BLOCK_COMPLETE,
+                                true))
                 .build();
     }
 
@@ -170,7 +200,9 @@ public class AnthropicResponseParser {
                                     response ->
                                             response != null
                                                     && (!response.getContent().isEmpty()
-                                                            || response.getUsage() != null));
+                                                            || response.getUsage() != null
+                                                            || response.getFinishReason() != null
+                                                            || !response.getMetadata().isEmpty()));
                 });
     }
 
@@ -182,6 +214,8 @@ public class AnthropicResponseParser {
         List<ContentBlock> contentBlocks = new ArrayList<>();
         ChatUsage usage = null;
         String messageId = null;
+        String finishReason = null;
+        Map<String, Object> metadata = Map.of();
 
         // Message start - record prompt usage (input tokens and cache read/creation tokens) so
         // the final usage emitted on message_delta can include it
@@ -203,6 +237,7 @@ public class AnthropicResponseParser {
         // Content block delta - text
         if (event.isContentBlockDelta()) {
             var deltaEvent = event.asContentBlockDelta();
+            metadata = Map.of(ChatResponse.METADATA_CONTENT_BLOCK_INDEX, deltaEvent.index());
 
             deltaEvent
                     .delta()
@@ -220,6 +255,23 @@ public class AnthropicResponseParser {
                                     contentBlocks.add(
                                             ThinkingBlock.builder()
                                                     .thinking(thinkingDelta.thinking())
+                                                    .build()));
+
+            // Signature delta (extended thinking): arrives after the thinking deltas of the
+            // same block and is carried as metadata so accumulation merges it into the
+            // thinking block without disturbing the accumulated text.
+            deltaEvent
+                    .delta()
+                    .signature()
+                    .ifPresent(
+                            signatureDelta ->
+                                    contentBlocks.add(
+                                            ThinkingBlock.builder()
+                                                    .metadata(
+                                                            Map.of(
+                                                                    ThinkingBlock
+                                                                            .METADATA_ANTHROPIC_SIGNATURE,
+                                                                    signatureDelta.signature()))
                                                     .build()));
 
             // Input JSON delta (tool calling)
@@ -242,6 +294,7 @@ public class AnthropicResponseParser {
         // Content block start - tool use
         if (event.isContentBlockStart()) {
             var startEvent = event.asContentBlockStart();
+            metadata = Map.of(ChatResponse.METADATA_CONTENT_BLOCK_INDEX, startEvent.index());
 
             startEvent
                     .contentBlock()
@@ -288,15 +341,41 @@ public class AnthropicResponseParser {
                                                 .build());
                             });
 
+            // Redacted thinking arrives complete in the start event (no deltas)
+            startEvent
+                    .contentBlock()
+                    .redactedThinking()
+                    .ifPresent(
+                            redacted ->
+                                    contentBlocks.add(
+                                            ThinkingBlock.builder()
+                                                    .metadata(
+                                                            Map.of(
+                                                                    ThinkingBlock
+                                                                            .METADATA_ANTHROPIC_REDACTED_DATA,
+                                                                    redacted.data()))
+                                                    .build()));
+
             // Server tool results arrive complete in the start event
             SERVER_TOOL_HELPER
                     .toResultParam(startEvent.contentBlock())
                     .ifPresent(param -> contentBlocks.add(SERVER_TOOL_HELPER.decodeResult(param)));
         }
 
+        if (event.isContentBlockStop()) {
+            metadata =
+                    Map.of(
+                            ChatResponse.METADATA_CONTENT_BLOCK_INDEX,
+                            event.asContentBlockStop().index(),
+                            ChatResponse.METADATA_CONTENT_BLOCK_COMPLETE,
+                            true);
+        }
+
         // Message delta - final usage information; combine the cumulative output tokens with
         // the prompt usage captured on message_start
         if (event.isMessageDelta()) {
+            finishReason =
+                    event.asMessageDelta().delta().stopReason().map(Object::toString).orElse(null);
             var deltaUsage = event.asMessageDelta().usage();
             long cacheReadTokens =
                     deltaUsage.cacheReadInputTokens().orElse((long) usageState.cachedTokens);
@@ -324,7 +403,13 @@ public class AnthropicResponseParser {
                             .build();
         }
 
-        return ChatResponse.builder().id(messageId).content(contentBlocks).usage(usage).build();
+        return ChatResponse.builder()
+                .id(messageId)
+                .content(contentBlocks)
+                .usage(usage)
+                .metadata(metadata)
+                .finishReason(finishReason)
+                .build();
     }
 
     /**
