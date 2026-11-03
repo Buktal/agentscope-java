@@ -118,3 +118,20 @@ AI coding instructions for AgentScope Java.
 - Lead with the result.
 - Include changed files, checks and results, and remaining gaps.
 - Keep unrelated findings brief and separate.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as local Markdown under `.scratch/` (ZenTao remains
+the delivery ledger). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary, recorded in each ticket's `Status:` line.
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` (lazily created) + `docs/adr/`, plus
+`CONTEXT.md` for channel vocabulary. See `docs/agents/domain.md`.
