@@ -18,8 +18,7 @@ package io.agentscope.harness.agent.context;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
@@ -27,6 +26,8 @@ import static org.mockito.Mockito.when;
 
 import io.agentscope.core.agent.Agent;
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.agent.ThreadKey;
+import io.agentscope.core.journal.JournalEvent;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.message.TextBlock;
@@ -41,16 +42,28 @@ import io.agentscope.core.model.ToolSchema;
 import io.agentscope.core.state.AgentState;
 import io.agentscope.core.tool.builtin.TodoTools;
 import io.agentscope.core.tool.builtin.TodoTools.TodoItem;
+import io.agentscope.core.util.JsonUtils;
+import io.agentscope.harness.agent.filesystem.local.LocalFilesystem;
+import io.agentscope.harness.agent.journal.WorkspaceThreadJournalStore;
 import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
+import io.agentscope.harness.agent.memory.compaction.ToolResultEvictionConfig;
 import io.agentscope.harness.agent.middleware.CompactionMiddleware;
+import io.agentscope.harness.agent.middleware.ToolResultEvictionMiddleware;
+import io.agentscope.harness.agent.tool.ThreadHistoryTool;
+import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import reactor.core.publisher.Flux;
 import reactor.test.StepVerifier;
 
 class HarnessContextBuilderTest {
+
+    @TempDir Path directory;
+
     @Test
     void optionalMemoryYieldsToCurrentUserAndManifestRecordsOmission() {
         var manifests = new ArrayList<ContextManifest>();
@@ -135,6 +148,140 @@ class HarnessContextBuilderTest {
                 IllegalArgumentException.class, () -> ContextPolicy.fromMap(Map.of("unknown", 1)));
     }
 
+    @Test
+    void boundedThreadSearchAndOffloadedToolResultsFitTheInputBudget() {
+        // C11 evidence: 12 matches, one stored message ~80K characters; plus a 143K tool output.
+        String hugeMatch = "needle huge " + "x".repeat(80_701);
+        var key = new ThreadKey("u", "HarnessAgent", "session-1", "main");
+        var toolContext = RuntimeContext.builder().userId("u").build();
+        var store = new WorkspaceThreadJournalStore(new LocalFilesystem(directory));
+        var log = store.open(key, toolContext);
+        var writer = log.acquire("owner", Duration.ofMinutes(2));
+        var events = new ArrayList<JournalEvent>();
+        for (int i = 1; i <= 11; i++) {
+            events.add(
+                    seededEvent(
+                            "m" + i,
+                            i,
+                            "message/user",
+                            Msg.builder()
+                                    .id("m" + i)
+                                    .role(MsgRole.USER)
+                                    .content(TextBlock.builder().text("needle item " + i).build())
+                                    .build()));
+        }
+        events.add(
+                seededEvent(
+                        "m12",
+                        12,
+                        "tool/result",
+                        Msg.builderForRole(MsgRole.TOOL)
+                                .id("m12")
+                                .content(
+                                        ToolResultBlock.of(
+                                                "previous-call",
+                                                "thread_search",
+                                                TextBlock.builder().text(hugeMatch).build()))
+                                .build()));
+        log.commit(writer, "messages", 0, events);
+        log.release(writer);
+
+        ThreadHistoryTool tool =
+                new ThreadHistoryTool(
+                        new WorkspaceThreadJournalStore(new LocalFilesystem(directory)));
+        String search =
+                ((TextBlock)
+                                tool.threadSearch(toolContext, "needle", "HarnessAgent", 20)
+                                        .getOutput()
+                                        .get(0))
+                        .getText();
+
+        Msg assistant =
+                Msg.builder()
+                        .role(MsgRole.ASSISTANT)
+                        .content(
+                                ToolUseBlock.builder()
+                                        .id("s1")
+                                        .name("thread_search")
+                                        .input(Map.of())
+                                        .build(),
+                                ToolUseBlock.builder()
+                                        .id("e1")
+                                        .name("execute")
+                                        .input(Map.of())
+                                        .build())
+                        .build();
+        String hugeExecute = "command output " + "z".repeat(143_000);
+        Msg toolMessage =
+                Msg.builderForRole(MsgRole.TOOL)
+                        .id("t1")
+                        .content(
+                                ToolResultBlock.of(
+                                        "s1",
+                                        "thread_search",
+                                        TextBlock.builder().text(search).build()),
+                                ToolResultBlock.of(
+                                        "e1",
+                                        "execute",
+                                        TextBlock.builder().text(hugeExecute).build()))
+                        .build();
+        List<Msg> history =
+                List.of(
+                        Msg.builder()
+                                .role(MsgRole.USER)
+                                .textContent("find the playlist history")
+                                .build(),
+                        assistant,
+                        toolMessage);
+        var state = AgentState.builder().build();
+        state.contextMutable().addAll(history);
+        var rc = RuntimeContext.builder().agentState(state).build();
+        var request =
+                new ModelCallInput(
+                        history,
+                        List.of(),
+                        GenerateOptions.builder().maxTokens(20).build(),
+                        model(128_000));
+
+        List<ContextManifest> manifests = new ArrayList<>();
+        var policy =
+                new ContextPolicy(
+                        64_000, 0, 0, ContextTokenEstimator.approximate(), manifests::add);
+        var agent = mock(Agent.class);
+        when(agent.getName()).thenReturn("HarnessAgent");
+        var prepared =
+                new HarnessContextBuilder(
+                                policy,
+                                null,
+                                new ToolResultEvictionMiddleware(
+                                        new LocalFilesystem(directory),
+                                        ToolResultEvictionConfig.defaults()))
+                        .prepare(agent, rc, request, "c1", ModelRequestPreparer.Purpose.REASONING)
+                        .block();
+
+        assertNotNull(prepared);
+        String preparedJson = JsonUtils.getJsonCodec().toJson(prepared.messages());
+        assertTrue(preparedJson.contains("Message truncated"));
+        assertTrue(preparedJson.contains("Tool output was too large"));
+        assertFalse(preparedJson.contains("x".repeat(10_000)));
+        assertEquals("passed", manifests.get(0).validation());
+        assertTrue(manifests.get(0).transforms().contains("tool_result_offload"));
+        assertTrue(manifests.get(0).estimatedInputTokens() <= manifests.get(0).inputLimit());
+    }
+
+    private static JournalEvent seededEvent(String id, long seq, String type, Msg message) {
+        return new JournalEvent(
+                JournalEvent.SCHEMA_VERSION,
+                id,
+                seq,
+                seq,
+                type,
+                "run",
+                "turn",
+                true,
+                JsonUtils.getJsonCodec().toJson(Map.of("message", message)));
+    }
+
     private Model model(int window) {
         Model model = mock(Model.class);
         when(model.getContextWindowSize()).thenReturn(window);
@@ -214,113 +361,6 @@ class HarnessContextBuilderTest {
                                 ModelRequestPreparer.Purpose.REASONING)
                         .block();
         assertEquals(1, other.messages().size());
-    }
-
-    @Test
-    void runtimeMaterialsPrecedeConversationAndStayByteStableAcrossCalls() {
-        var state = AgentState.builder().build();
-        var rc = RuntimeContext.builder().agentState(state).build();
-        rc.put(
-                WorkspaceContextMaterials.class,
-                new WorkspaceContextMaterials(
-                        List.of(
-                                ContextItem.instruction(
-                                        "environment", "harness:environment", "env facts"),
-                                ContextItem.runtimeState(
-                                        "skills", "harness:skills", true, "skill catalog"),
-                                ContextItem.runtimeState(
-                                        "session_state",
-                                        "harness:session-state",
-                                        false,
-                                        "facts"))));
-        new TodoTools().write(List.of(new TodoItem("task", "pending", null)), state);
-        Msg firstTurn = Msg.builder().role(MsgRole.USER).textContent("first turn").build();
-        state.contextMutable().add(firstTurn);
-        var builder = new HarnessContextBuilder(ContextPolicy.defaults(), null, null);
-        var first =
-                builder.prepare(
-                                mock(Agent.class),
-                                rc,
-                                new ModelCallInput(
-                                        List.of(firstTurn), List.of(), null, model(4096)),
-                                "c1",
-                                ModelRequestPreparer.Purpose.REASONING)
-                        .block();
-        // Prefix-cache contract: the compiled system head and the stable runtime block sit
-        // before the conversation...
-        assertEquals(MsgRole.SYSTEM, first.messages().get(0).getRole());
-        assertTrue(first.messages().get(0).getTextContent().contains("env facts"));
-        assertEquals("harness:runtime_materials", first.messages().get(1).getId());
-        assertTrue(first.messages().get(1).getTextContent().contains("skill catalog"));
-        assertSame(firstTurn, first.messages().get(2));
-        // ...while the volatile todo reminder stays after it
-        assertEquals("harness:todo_state", first.messages().get(3).getId());
-
-        Msg reply = Msg.builder().role(MsgRole.ASSISTANT).textContent("working").build();
-        Msg secondTurn = Msg.builder().role(MsgRole.USER).textContent("second turn").build();
-        state.contextMutable().add(reply);
-        state.contextMutable().add(secondTurn);
-        var second =
-                builder.prepare(
-                                mock(Agent.class),
-                                rc,
-                                new ModelCallInput(
-                                        List.of(firstTurn, reply, secondTurn),
-                                        List.of(),
-                                        null,
-                                        model(4096)),
-                                "c2",
-                                ModelRequestPreparer.Purpose.REASONING)
-                        .block();
-        assertSame(firstTurn, second.messages().get(2));
-        assertSame(reply, second.messages().get(3));
-        assertSame(secondTurn, second.messages().get(4));
-        assertEquals("harness:todo_state", second.messages().get(5).getId());
-        // Unchanged materials render byte-identical head content, so the prefix through the
-        // runtime block stays a cache hit as the conversation grows instead of being
-        // re-processed per request. Compared by content: Msg equality also covers the per-build
-        // timestamp, which is not part of the rendered request bytes.
-        assertEquals(
-                first.messages().get(0).getTextContent(),
-                second.messages().get(0).getTextContent());
-        assertEquals("harness:runtime_materials", second.messages().get(1).getId());
-        assertEquals(
-                first.messages().get(1).getTextContent(),
-                second.messages().get(1).getTextContent());
-
-        // A changed catalog costs a single invalidation from the runtime block onward: the
-        // system head above it keeps its bytes and the conversation keeps its identity.
-        rc.put(
-                WorkspaceContextMaterials.class,
-                new WorkspaceContextMaterials(
-                        List.of(
-                                ContextItem.instruction(
-                                        "environment", "harness:environment", "env facts"),
-                                ContextItem.runtimeState(
-                                        "skills", "harness:skills", true, "updated catalog"),
-                                ContextItem.runtimeState(
-                                        "session_state",
-                                        "harness:session-state",
-                                        false,
-                                        "facts"))));
-        var third =
-                builder.prepare(
-                                mock(Agent.class),
-                                rc,
-                                new ModelCallInput(
-                                        List.of(firstTurn, reply, secondTurn),
-                                        List.of(),
-                                        null,
-                                        model(4096)),
-                                "c3",
-                                ModelRequestPreparer.Purpose.REASONING)
-                        .block();
-        assertEquals(
-                first.messages().get(0).getTextContent(), third.messages().get(0).getTextContent());
-        assertTrue(third.messages().get(1).getTextContent().contains("updated catalog"));
-        assertNotEquals(
-                first.messages().get(1).getTextContent(), third.messages().get(1).getTextContent());
-        assertSame(firstTurn, third.messages().get(2));
     }
 
     @Test

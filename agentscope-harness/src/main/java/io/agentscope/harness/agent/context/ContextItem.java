@@ -53,9 +53,8 @@ public record ContextItem(
     }
 
     /**
-     * Per-call state rendered before the conversation, keeping its bytes inside the cacheable
-     * request prefix. Required materials remain visible during history compaction; optional
-     * facts may be omitted under budget.
+     * Per-call state rendered after the conversation. Required materials remain visible during
+     * history compaction; optional facts may be omitted under budget.
      */
     public static ContextItem runtimeState(
             String kind, String sourceId, boolean required, String content) {
@@ -63,7 +62,7 @@ public record ContextItem(
                 kind, sourceId, versionOf(content), Placement.RUNTIME, required, 50, content);
     }
 
-    private static String versionOf(String content) {
+    static String versionOf(String content) {
         try {
             return HexFormat.of()
                     .formatHex(
